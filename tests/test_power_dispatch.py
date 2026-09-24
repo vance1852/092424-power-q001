@@ -15,17 +15,92 @@ from power_dispatch.risk import DemandBucket, inventory_coverage, mark_to_market
 
 
 class PlanningTests(unittest.TestCase):
-    def test_latest_down_streak_uses_first_close_as_base(self) -> None:
+    def test_latest_down_streak_counts_changes_between_settlement_days(self) -> None:
+        streak = latest_streak([
+            PricePoint("2026-09-18", Decimal("108"), "r18"),
+            PricePoint("2026-09-19", Decimal("105"), "r19"),
+            PricePoint("2026-09-20", Decimal("102"), "r20"),
+            PricePoint("2026-09-21", Decimal("98"), "r21"),
+        ])
+        self.assertEqual(streak.direction, "down")
+        # 四个报价点之间只有三次相邻结算日变化，而不是四个报价点。
+        self.assertEqual(streak.changes, 3)
+        self.assertEqual(streak.start_date, "2026-09-18")
+        self.assertEqual(streak.start_close, Decimal("108"))
+        self.assertEqual(streak.end_date, "2026-09-21")
+        self.assertEqual(streak.end_close, Decimal("98"))
+        self.assertEqual(streak.percent_change, Decimal("-9.2593"))
+        self.assertEqual(streak.start_revision, "r18")
+        self.assertEqual(streak.end_revision, "r21")
+        self.assertFalse(streak.truncated)
+
+    def test_six_declines_across_seven_points_are_six_changes(self) -> None:
+        streak = latest_streak([
+            PricePoint(f"2026-09-{day:02d}", Decimal(str(close)))
+            for day, close in enumerate((108, 105, 102, 100, 98, 96, 94), start=18)
+        ])
+        self.assertEqual(streak.direction, "down")
+        self.assertEqual(streak.changes, 6)
+        self.assertEqual(streak.start_date, "2026-09-18")
+        self.assertEqual(streak.start_close, Decimal("108"))
+        self.assertEqual(streak.end_close, Decimal("94"))
+
+    def test_up_streak_counts_edges_and_uses_first_edge_base(self) -> None:
+        streak = latest_streak([
+            PricePoint("2026-09-18", Decimal("94")),
+            PricePoint("2026-09-19", Decimal("96")),
+            PricePoint("2026-09-20", Decimal("100")),
+        ])
+        self.assertEqual(streak.direction, "up")
+        self.assertEqual(streak.changes, 2)
+        self.assertEqual(streak.start_date, "2026-09-18")
+        self.assertEqual(streak.start_close, Decimal("94"))
+        self.assertEqual(streak.end_close, Decimal("100"))
+
+    def test_flat_is_one_change_and_breaks_a_down_run(self) -> None:
         streak = latest_streak([
             PricePoint("2026-09-18", Decimal("108")),
             PricePoint("2026-09-19", Decimal("105")),
-            PricePoint("2026-09-20", Decimal("102")),
-            PricePoint("2026-09-21", Decimal("98")),
+            PricePoint("2026-09-20", Decimal("105")),
         ])
-        self.assertEqual(streak.direction, "down")
-        self.assertEqual(streak.sessions, 4)
-        self.assertEqual(streak.start_date, "2026-09-18")
-        self.assertEqual(streak.end_close, Decimal("98"))
+        self.assertEqual(streak.direction, "flat")
+        self.assertEqual(streak.changes, 1)
+        self.assertEqual(streak.start_date, "2026-09-19")
+        self.assertEqual(streak.end_date, "2026-09-20")
+        self.assertEqual(streak.start_close, Decimal("105"))
+        self.assertEqual(streak.end_close, Decimal("105"))
+        self.assertEqual(streak.percent_change, Decimal("0.0000"))
+
+    def test_rebound_breaks_the_down_streak(self) -> None:
+        streak = latest_streak([
+            PricePoint("2026-09-18", Decimal("108")),
+            PricePoint("2026-09-19", Decimal("105")),
+            PricePoint("2026-09-20", Decimal("106")),
+        ])
+        self.assertEqual(streak.direction, "up")
+        self.assertEqual(streak.changes, 1)
+        self.assertEqual(streak.start_date, "2026-09-19")
+
+    def test_single_point_has_no_change(self) -> None:
+        self.assertIsNone(latest_streak([PricePoint("2026-09-18", Decimal("108"))]))
+        self.assertIsNone(latest_streak([]))
+
+    def test_streak_marks_window_truncation_from_preceding_point(self) -> None:
+        window = [
+            PricePoint("2026-09-22", Decimal("102")),
+            PricePoint("2026-09-23", Decimal("98")),
+            PricePoint("2026-09-24", Decimal("94")),
+        ]
+        preceded = latest_streak(
+            window, preceding_point=PricePoint("2026-09-21", Decimal("105"))
+        )
+        self.assertEqual(preceded.changes, 2)
+        self.assertTrue(preceded.truncated)
+        bounded = latest_streak(
+            window, preceding_point=PricePoint("2026-09-21", Decimal("100"))
+        )
+        self.assertEqual(bounded.changes, 2)
+        self.assertFalse(bounded.truncated)
 
     def test_allocation_is_stable_and_does_not_exceed_capacity(self) -> None:
         rows = allocate_capacity(Decimal("100"), [
@@ -84,6 +159,46 @@ class SupplyServiceTests(unittest.TestCase):
         rows = self.connection.execute("SELECT * FROM market_index_quotes ORDER BY quote_id").fetchall()
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1]["supersedes_quote_id"], rows[0]["quote_id"])
+
+    def test_price_summary_six_declines_revision_and_window(self) -> None:
+        for day, close in ((18, "108"), (19, "105"), (20, "102"), (21, "100"), (22, "98"), (23, "96"), (24, "94")):
+            self.quote(day, close)
+        summary = self.service.price_summary("PEAK_VALLEY")
+        streak = summary["latest_streak"]
+        self.assertEqual(streak["direction"], "down")
+        self.assertEqual(streak["changes"], 6)
+        self.assertEqual(streak["start_date"], "2026-09-18")
+        self.assertEqual(streak["start_close"], "108")
+        self.assertEqual(streak["end_close"], "94")
+        self.assertEqual(streak["start_revision"], "r-18")
+        self.assertEqual(streak["end_revision"], "r-24")
+        self.assertFalse(streak["truncated"])
+        self.assertEqual(summary["latest"]["source_revision"], "r-24")
+
+        # 同日修订：摘要采用最新来源版本并按修订报价重算累计跌幅。
+        self.service.record_quote("plan", {"market_index": "PEAK_VALLEY", "trade_date": "2026-09-24", "close_cny": "94.5", "source_revision": "r-24-corrected", "observed_at": "2026-09-24T22:30:00Z"})
+        revised = self.service.price_summary("PEAK_VALLEY")["latest_streak"]
+        self.assertEqual(revised["changes"], 6)
+        self.assertEqual(revised["end_close"], "94.5")
+        self.assertEqual(revised["end_revision"], "r-24-corrected")
+        self.assertEqual(revised["percent_change"], "-12.5000")
+
+        # 查询窗口截断：最近三点内是两次下跌，但窗口外仍同向延续。
+        window = self.service.price_summary("PEAK_VALLEY", sessions=3)["latest_streak"]
+        self.assertEqual(window["changes"], 2)
+        self.assertEqual(window["start_date"], "2026-09-22")
+        self.assertTrue(window["truncated"])
+
+        # 平盘打断：新增一个结算日且报价与前一日相同，只计一次平盘变化。
+        self.service.record_quote("plan", {"market_index": "PEAK_VALLEY", "trade_date": "2026-09-25", "close_cny": "94.5", "source_revision": "r-25", "observed_at": "2026-09-25T21:00:00Z"})
+        flat = self.service.price_summary("PEAK_VALLEY")["latest_streak"]
+        self.assertEqual(flat["direction"], "flat")
+        self.assertEqual(flat["changes"], 1)
+        self.assertEqual(flat["start_date"], "2026-09-24")
+        self.assertEqual(flat["end_date"], "2026-09-25")
+
+        # 不足两个点：不存在相邻结算日变化，连续段为空。
+        self.assertIsNone(self.service.price_summary("PEAK_VALLEY", sessions=1)["latest_streak"])
 
     def test_nomination_replay_and_payload_conflict(self) -> None:
         payload = {"nomination_id": "nom-1", "route_id": "pipe-a-b", "shipper_id": "refinery", "service_date": "2026-09-25", "requested_mwh": "80000", "priority": 10, "idempotency_key": "key-1"}

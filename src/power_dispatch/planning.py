@@ -38,57 +38,91 @@ def digest(value: object) -> str:
 class PricePoint:
     trade_date: str
     close: Decimal
+    source_revision: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Streak:
     direction: str
-    sessions: int
+    changes: int
     start_date: str
     end_date: str
     start_close: Decimal
     end_close: Decimal
     percent_change: Decimal
+    start_revision: str | None = None
+    end_revision: str | None = None
+    truncated: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
             "direction": self.direction,
-            "sessions": self.sessions,
+            "changes": self.changes,
             "start_date": self.start_date,
             "end_date": self.end_date,
             "start_close": decimal_text(self.start_close),
             "end_close": decimal_text(self.end_close),
             "percent_change": decimal_text(self.percent_change),
+            "start_revision": self.start_revision,
+            "end_revision": self.end_revision,
+            "truncated": self.truncated,
         }
 
 
-def latest_streak(points: Sequence[PricePoint]) -> Streak | None:
+def _edge_direction(left: PricePoint, right: PricePoint) -> str:
+    if right.close < left.close:
+        return "down"
+    if right.close > left.close:
+        return "up"
+    return "flat"
+
+
+def latest_streak(
+    points: Sequence[PricePoint],
+    *,
+    preceding_point: PricePoint | None = None,
+) -> Streak | None:
+    """返回截至最后一个结算日的连续同向变化段。
+
+    次数按相邻结算日报价之间真实发生的变化（边）计算：N 个报价点之间至多有
+    N-1 次变化，首个报价本身不构成变化。平盘计为一次变化，并会打断此前连续的
+    上涨或下跌段。``preceding_point`` 是查询窗口之前最近一个结算日的报价，
+    用于判定连续段是否在窗口起点被截断。
+    """
     ordered = sorted(points, key=lambda item: item.trade_date)
     if len(ordered) < 2:
         return None
-    last = ordered[-1]
-    previous = ordered[-2]
-    if last.close == previous.close:
-        return Streak("flat", 1, last.trade_date, last.trade_date, last.close, last.close, ZERO)
-    direction = "down" if last.close < previous.close else "up"
+
+    def direction_at(index: int) -> str:
+        return _edge_direction(ordered[index], ordered[index + 1])
+
+    direction = direction_at(len(ordered) - 2)
     start_index = len(ordered) - 2
-    while start_index > 0:
-        left = ordered[start_index - 1]
-        right = ordered[start_index]
-        matches = right.close < left.close if direction == "down" else right.close > left.close
-        if not matches:
-            break
+    while start_index > 0 and direction_at(start_index - 1) == direction:
         start_index -= 1
     start = ordered[start_index]
-    change = (last.close - start.close) / start.close * HUNDRED
+    last = ordered[-1]
+    changes = len(ordered) - 1 - start_index
+    if start.close == ZERO:
+        change = ZERO
+    else:
+        change = (last.close - start.close) / start.close * HUNDRED
+    truncated = (
+        preceding_point is not None
+        and start_index == 0
+        and _edge_direction(preceding_point, ordered[0]) == direction
+    )
     return Streak(
         direction=direction,
-        sessions=len(ordered) - start_index,
+        changes=changes,
         start_date=start.trade_date,
         end_date=last.trade_date,
         start_close=start.close,
         end_close=last.close,
         percent_change=change.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+        start_revision=start.source_revision,
+        end_revision=last.source_revision,
+        truncated=truncated,
     )
 
 

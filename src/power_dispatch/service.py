@@ -154,22 +154,47 @@ class SupplyService:
         return {"quote_id": quote_id, "market_index": quote.market_index, "trade_date": quote.trade_date}
 
     def price_summary(self, market_index: str, sessions: int = 20) -> dict[str, Any]:
+        if sessions <= 0:
+            raise ValidationFailed("sessions 必须是正整数")
+        index = market_index.upper()
         rows = self.connection.execute(
-            "SELECT q.trade_date,q.close_cny FROM market_index_quotes q "
+            "SELECT q.trade_date,q.close_cny,q.source_revision FROM market_index_quotes q "
             "JOIN (SELECT trade_date,max(quote_id) quote_id FROM market_index_quotes "
             "WHERE market_index=? GROUP BY trade_date) latest ON latest.quote_id=q.quote_id "
             "ORDER BY q.trade_date DESC LIMIT ?",
-            (market_index.upper(), sessions),
+            (index, sessions),
         ).fetchall()
-        points = [PricePoint(row["trade_date"], Decimal(row["close_cny"])) for row in rows]
+        points = [
+            PricePoint(row["trade_date"], Decimal(row["close_cny"]), row["source_revision"])
+            for row in rows
+        ]
         if not points:
             raise NotFound("没有基准电价")
-        streak = latest_streak(points)
+        preceding_point: PricePoint | None = None
+        if len(points) == sessions:
+            preceding = self.connection.execute(
+                "SELECT q.trade_date,q.close_cny,q.source_revision FROM market_index_quotes q "
+                "JOIN (SELECT trade_date,max(quote_id) quote_id FROM market_index_quotes "
+                "WHERE market_index=? GROUP BY trade_date) latest ON latest.quote_id=q.quote_id "
+                "WHERE q.trade_date<? ORDER BY q.trade_date DESC LIMIT 1",
+                (index, min(row["trade_date"] for row in rows)),
+            ).fetchone()
+            if preceding is not None:
+                preceding_point = PricePoint(
+                    preceding["trade_date"],
+                    Decimal(preceding["close_cny"]),
+                    preceding["source_revision"],
+                )
+        streak = latest_streak(points, preceding_point=preceding_point)
         average = moving_average(points, min(5, len(points)))
         latest = max(points, key=lambda item: item.trade_date)
         return {
-            "market_index": market_index.upper(),
-            "latest": {"trade_date": latest.trade_date, "close_cny": decimal_text(latest.close)},
+            "market_index": index,
+            "latest": {
+                "trade_date": latest.trade_date,
+                "close_cny": decimal_text(latest.close),
+                "source_revision": latest.source_revision,
+            },
             "latest_streak": None if streak is None else streak.as_dict(),
             "moving_average": None if average is None else decimal_text(average),
             "observations": len(points),
