@@ -38,10 +38,13 @@ def digest(value: object) -> str:
 class PricePoint:
     trade_date: str
     close: Decimal
+    quote_id: int | None = None
+    source_revision: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Streak:
+    # sessions 是相邻结算日之间同向变化的次数：n 个报价点最多产生 n-1 次变化。
     direction: str
     sessions: int
     start_date: str
@@ -49,6 +52,10 @@ class Streak:
     start_close: Decimal
     end_close: Decimal
     percent_change: Decimal
+    start_quote_id: int | None = None
+    end_quote_id: int | None = None
+    start_source_revision: str | None = None
+    end_source_revision: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -59,36 +66,51 @@ class Streak:
             "start_close": decimal_text(self.start_close),
             "end_close": decimal_text(self.end_close),
             "percent_change": decimal_text(self.percent_change),
+            "start_quote_id": self.start_quote_id,
+            "end_quote_id": self.end_quote_id,
+            "start_source_revision": self.start_source_revision,
+            "end_source_revision": self.end_source_revision,
         }
+
+
+def _pair_matches(left: PricePoint, right: PricePoint, direction: str) -> bool:
+    if direction == "flat":
+        return right.close == left.close
+    if direction == "down":
+        return right.close < left.close
+    return right.close > left.close
 
 
 def latest_streak(points: Sequence[PricePoint]) -> Streak | None:
     ordered = sorted(points, key=lambda item: item.trade_date)
+    # 不足两个报价点就不存在相邻结算日之间的变化，调用方需把 None 解释为零次变化。
     if len(ordered) < 2:
         return None
     last = ordered[-1]
     previous = ordered[-2]
     if last.close == previous.close:
-        return Streak("flat", 1, last.trade_date, last.trade_date, last.close, last.close, ZERO)
-    direction = "down" if last.close < previous.close else "up"
-    start_index = len(ordered) - 2
-    while start_index > 0:
-        left = ordered[start_index - 1]
-        right = ordered[start_index]
-        matches = right.close < left.close if direction == "down" else right.close > left.close
-        if not matches:
-            break
-        start_index -= 1
-    start = ordered[start_index]
-    change = (last.close - start.close) / start.close * HUNDRED
+        direction = "flat"
+    else:
+        direction = "down" if last.close < previous.close else "up"
+    # 从最后一对相邻报价向前数同向变化；平盘会打断上涨或下跌，反之亦然。
+    right_index = len(ordered) - 1
+    while right_index > 0 and _pair_matches(ordered[right_index - 1], ordered[right_index], direction):
+        right_index -= 1
+    start = ordered[right_index]
+    sessions = len(ordered) - 1 - right_index
+    change = ZERO if direction == "flat" else (last.close - start.close) / start.close * HUNDRED
     return Streak(
         direction=direction,
-        sessions=len(ordered) - start_index,
+        sessions=sessions,
         start_date=start.trade_date,
         end_date=last.trade_date,
         start_close=start.close,
         end_close=last.close,
         percent_change=change.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+        start_quote_id=start.quote_id,
+        end_quote_id=last.quote_id,
+        start_source_revision=start.source_revision,
+        end_source_revision=last.source_revision,
     )
 
 

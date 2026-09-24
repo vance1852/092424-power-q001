@@ -154,25 +154,47 @@ class SupplyService:
         return {"quote_id": quote_id, "market_index": quote.market_index, "trade_date": quote.trade_date}
 
     def price_summary(self, market_index: str, sessions: int = 20) -> dict[str, Any]:
+        if isinstance(sessions, bool) or not isinstance(sessions, int) or sessions < 1:
+            raise ValidationFailed("sessions 必须是正整数")
+        index = market_index.upper()
         rows = self.connection.execute(
-            "SELECT q.trade_date,q.close_cny FROM market_index_quotes q "
+            "SELECT q.quote_id,q.trade_date,q.close_cny,q.source_revision FROM market_index_quotes q "
             "JOIN (SELECT trade_date,max(quote_id) quote_id FROM market_index_quotes "
             "WHERE market_index=? GROUP BY trade_date) latest ON latest.quote_id=q.quote_id "
             "ORDER BY q.trade_date DESC LIMIT ?",
-            (market_index.upper(), sessions),
+            (index, sessions),
         ).fetchall()
-        points = [PricePoint(row["trade_date"], Decimal(row["close_cny"])) for row in rows]
+        points = [
+            PricePoint(row["trade_date"], Decimal(row["close_cny"]), row["quote_id"], row["source_revision"])
+            for row in rows
+        ]
         if not points:
             raise NotFound("没有基准电价")
-        streak = latest_streak(points)
-        average = moving_average(points, min(5, len(points)))
-        latest = max(points, key=lambda item: item.trade_date)
+        ordered = sorted(points, key=lambda item: item.trade_date)
+        first, latest = ordered[0], ordered[-1]
+        earlier = self.connection.execute(
+            "SELECT 1 FROM market_index_quotes WHERE market_index=? AND trade_date<? LIMIT 1",
+            (index, first.trade_date),
+        ).fetchone()
+        streak = latest_streak(ordered)
+        average = moving_average(ordered, min(5, len(ordered)))
         return {
-            "market_index": market_index.upper(),
+            "market_index": index,
             "latest": {"trade_date": latest.trade_date, "close_cny": decimal_text(latest.close)},
             "latest_streak": None if streak is None else streak.as_dict(),
             "moving_average": None if average is None else decimal_text(average),
-            "observations": len(points),
+            "observations": len(ordered),
+            "window": {
+                "requested_sessions": sessions,
+                "start_date": first.trade_date,
+                "end_date": latest.trade_date,
+                "start_quote_id": first.quote_id,
+                "end_quote_id": latest.quote_id,
+                "start_source_revision": first.source_revision,
+                "end_source_revision": latest.source_revision,
+                "observations": len(ordered),
+                "earlier_history": earlier is not None,
+            },
         }
 
     def create_facility(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:

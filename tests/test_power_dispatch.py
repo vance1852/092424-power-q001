@@ -15,17 +15,52 @@ from power_dispatch.risk import DemandBucket, inventory_coverage, mark_to_market
 
 
 class PlanningTests(unittest.TestCase):
-    def test_latest_down_streak_uses_first_close_as_base(self) -> None:
+    def test_latest_down_streak_counts_changes_not_points(self) -> None:
         streak = latest_streak([
             PricePoint("2026-09-18", Decimal("108")),
             PricePoint("2026-09-19", Decimal("105")),
             PricePoint("2026-09-20", Decimal("102")),
             PricePoint("2026-09-21", Decimal("98")),
         ])
+        # 四个报价点之间只发生三次下跌，起始报价仍是首个报价点。
         self.assertEqual(streak.direction, "down")
-        self.assertEqual(streak.sessions, 4)
+        self.assertEqual(streak.sessions, 3)
         self.assertEqual(streak.start_date, "2026-09-18")
+        self.assertEqual(streak.start_close, Decimal("108"))
         self.assertEqual(streak.end_close, Decimal("98"))
+
+    def test_flat_close_interrupts_directional_streak(self) -> None:
+        streak = latest_streak([
+            PricePoint("2026-09-18", Decimal("108")),
+            PricePoint("2026-09-19", Decimal("105")),
+            PricePoint("2026-09-20", Decimal("105")),
+            PricePoint("2026-09-21", Decimal("103")),
+        ])
+        self.assertEqual(streak.direction, "down")
+        self.assertEqual(streak.sessions, 1)
+        self.assertEqual(streak.start_date, "2026-09-20")
+        self.assertEqual(streak.percent_change, Decimal("-1.9048"))
+        flat = latest_streak([
+            PricePoint("2026-09-18", Decimal("100")),
+            PricePoint("2026-09-19", Decimal("100")),
+            PricePoint("2026-09-20", Decimal("100")),
+        ])
+        self.assertEqual(flat.direction, "flat")
+        self.assertEqual(flat.sessions, 2)
+        self.assertEqual(flat.percent_change, Decimal("0.0000"))
+        self.assertIsNone(latest_streak([PricePoint("2026-09-18", Decimal("100"))]))
+
+    def test_up_streak_starts_after_last_flat_interruption(self) -> None:
+        streak = latest_streak([
+            PricePoint("2026-09-18", Decimal("90")),
+            PricePoint("2026-09-19", Decimal("92")),
+            PricePoint("2026-09-20", Decimal("92")),
+            PricePoint("2026-09-21", Decimal("95")),
+            PricePoint("2026-09-22", Decimal("98")),
+        ])
+        self.assertEqual(streak.direction, "up")
+        self.assertEqual(streak.sessions, 2)
+        self.assertEqual(streak.start_date, "2026-09-20")
 
     def test_allocation_is_stable_and_does_not_exceed_capacity(self) -> None:
         rows = allocate_capacity(Decimal("100"), [
@@ -84,6 +119,51 @@ class SupplyServiceTests(unittest.TestCase):
         rows = self.connection.execute("SELECT * FROM market_index_quotes ORDER BY quote_id").fetchall()
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1]["supersedes_quote_id"], rows[0]["quote_id"])
+
+    def test_summary_counts_six_drops_across_seven_points(self) -> None:
+        for day, close in zip(range(18, 25), ("108", "105", "102", "100", "98", "96", "94")):
+            self.quote(day, close)
+        summary = self.service.price_summary("PEAK_VALLEY")
+        streak = summary["latest_streak"]
+        self.assertEqual(summary["observations"], 7)
+        self.assertEqual((streak["direction"], streak["sessions"]), ("down", 6))
+        self.assertEqual((streak["start_date"], streak["start_close"]), ("2026-09-18", "108"))
+        self.assertEqual((streak["end_date"], streak["end_close"]), ("2026-09-24", "94"))
+        self.assertEqual(streak["percent_change"], "-12.9630")
+        self.assertEqual(streak["start_source_revision"], "r-18")
+        self.assertEqual(streak["end_source_revision"], "r-24")
+        self.assertFalse(summary["window"]["earlier_history"])
+
+    def test_summary_same_day_revision_recomputes_streak_basis(self) -> None:
+        for day, close in zip(range(18, 25), ("108", "105", "102", "100", "98", "96", "94")):
+            self.quote(day, close)
+        corrected = self.service.record_quote("plan", {"market_index": "PEAK_VALLEY", "trade_date": "2026-09-24", "close_cny": "93", "source_revision": "r-24-corrected", "observed_at": "2026-09-24T22:00:00Z"})
+        streak = self.service.price_summary("PEAK_VALLEY")["latest_streak"]
+        self.assertEqual(streak["sessions"], 6)
+        self.assertEqual(streak["end_close"], "93")
+        self.assertEqual(streak["percent_change"], "-13.8889")
+        self.assertEqual(streak["end_quote_id"], corrected["quote_id"])
+        self.assertEqual(streak["end_source_revision"], "r-24-corrected")
+        self.assertIsNotNone(streak["start_quote_id"])
+
+    def test_summary_truncated_window_counts_only_changes_inside(self) -> None:
+        for day, close in zip(range(18, 25), ("108", "105", "102", "100", "98", "96", "94")):
+            self.quote(day, close)
+        summary = self.service.price_summary("PEAK_VALLEY", sessions=5)
+        self.assertEqual(summary["observations"], 5)
+        streak = summary["latest_streak"]
+        self.assertEqual(streak["sessions"], 4)
+        self.assertEqual(streak["start_date"], "2026-09-20")
+        self.assertTrue(summary["window"]["earlier_history"])
+        self.assertEqual(summary["window"]["requested_sessions"], 5)
+
+    def test_summary_single_point_has_no_streak(self) -> None:
+        self.quote(24, "94")
+        summary = self.service.price_summary("PEAK_VALLEY")
+        self.assertEqual(summary["observations"], 1)
+        self.assertIsNone(summary["latest_streak"])
+        self.assertEqual(summary["window"]["start_quote_id"], summary["window"]["end_quote_id"])
+        self.assertFalse(summary["window"]["earlier_history"])
 
     def test_nomination_replay_and_payload_conflict(self) -> None:
         payload = {"nomination_id": "nom-1", "route_id": "pipe-a-b", "shipper_id": "refinery", "service_date": "2026-09-25", "requested_mwh": "80000", "priority": 10, "idempotency_key": "key-1"}
